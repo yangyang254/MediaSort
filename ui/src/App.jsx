@@ -34,6 +34,7 @@ import {
   Play,
   ArrowUpDown,
   LayoutGrid,
+  Pencil,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -257,12 +258,6 @@ const keyCharFromEvent = (e) => {
     if (/[a-zA-Z]/.test(key)) return key.toLowerCase();
   }
   return null;
-};
-
-// Index of the destination a key press selects, or -1 for "not a folder key".
-const destinationIndexForKey = (e) => {
-  const char = keyCharFromEvent(e);
-  return char === null ? -1 : DESTINATION_KEY_ORDER.indexOf(char);
 };
 
 // True when that key is also bound to Next/Previous/Delete in the settings.
@@ -504,7 +499,7 @@ const SettingsPopup = ({
           </h3>
 
           <div className="text-xs text-zinc-500 mb-1.5">Card size</div>
-          <div className="flex gap-2 mb-4">
+          <div className="flex gap-2 mb-4" data-card-sizes>
             {Object.values(CARD_SIZES).map((size) => (
               <button
                 key={size.key}
@@ -524,7 +519,7 @@ const SettingsPopup = ({
           <div className="text-xs text-zinc-500 mb-1.5">
             Rows in the folder dock
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2" data-dock-rows>
             {DOCK_ROW_OPTIONS.map((rows) => (
               <button
                 key={rows}
@@ -677,11 +672,14 @@ const DestinationCard = ({
   isDropTarget,
   innerRef,
   shortcuts,
+  keyLabel,
+  isRebinding,
+  onRebindKey,
   sizeDef = CARD_SIZES[DEFAULT_CARD_SIZE],
 }) => {
   const parts = path.split(/[/\\]/);
   const name = parts[parts.length - 1] || path;
-  const shortcutLabel = shortcutLabelForIndex(index);
+  const shortcutLabel = keyLabel ?? shortcutLabelForIndex(index);
   // A key already used by Next/Previous/Delete cannot also pick a folder.
   const shortcutTaken = isKeyReservedForAction(shortcutLabel, shortcuts);
   const activeShortcut = shortcutLabel && !shortcutTaken ? shortcutLabel : null;
@@ -705,27 +703,36 @@ const DestinationCard = ({
         )}
       ></div>
 
-      {/* Shortcut Indicator */}
-      <div
+      {/* Shortcut badge - click it to rebind this folder's key */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRebindKey?.(path);
+        }}
         title={
-          activeShortcut
-            ? `Press ${activeShortcut.toUpperCase()} to move here`
-            : shortcutTaken
-              ? `${shortcutLabel.toUpperCase()} is bound to another action`
-              : "No keyboard shortcut"
+          isRebinding
+            ? "Press the new shortcut, Esc to cancel"
+            : activeShortcut
+              ? `Press ${activeShortcut.toUpperCase()} to move here - click to change`
+              : shortcutTaken
+                ? `${shortcutLabel.toUpperCase()} is bound to another action - click to change`
+                : "Click to assign a shortcut"
         }
         className={clsx(
-          "absolute top-1 left-1 rounded-md border flex items-center justify-center font-bold uppercase transition-colors z-10",
+          "absolute top-1 left-1 rounded-md border flex items-center justify-center font-bold uppercase transition-colors z-20",
           sizeDef.badge,
-          isDropTarget
-            ? "bg-emerald-400 border-emerald-300 text-emerald-950"
-            : activeShortcut
-              ? "bg-white/5 border-white/5 text-gray-500 group-hover:text-indigo-400 group-hover:bg-indigo-500/10 group-hover:border-indigo-500/20"
-              : "bg-white/5 border-white/5 text-gray-700",
+          isRebinding
+            ? "bg-indigo-500 border-indigo-300 text-white ring-2 ring-indigo-400/50 animate-pulse"
+            : isDropTarget
+              ? "bg-emerald-400 border-emerald-300 text-emerald-950"
+              : activeShortcut
+                ? "bg-white/5 border-white/5 text-gray-500 group-hover:text-indigo-400 group-hover:bg-indigo-500/10 group-hover:border-indigo-500/20"
+                : "bg-white/5 border-white/5 text-gray-700",
         )}
       >
-        {activeShortcut ?? index + 1}
-      </div>
+        {isRebinding ? "?" : activeShortcut ?? index + 1}
+      </button>
 
       {/* Drop hint */}
       {isDropTarget && (
@@ -871,7 +878,78 @@ const Thumbnail = ({ filename, sourcePath, current, onClick, onPointerDown }) =>
   );
 };
 
-// --- Alert Popup ---
+// --- RENAME DIALOG ---
+
+const RenameDialog = ({ isOpen, initialValue, onCancel, onConfirm }) => {
+  const [value, setValue] = useState(initialValue || "");
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    setValue(initialValue || "");
+    // Focus and preselect the base name (everything before the extension), so
+    // typing replaces the name but keeps the suffix.
+    const timer = setTimeout(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      input.focus();
+      const dot = (initialValue || "").lastIndexOf(".");
+      input.setSelectionRange(0, dot > 0 ? dot : (initialValue || "").length);
+    }, 30);
+    return () => clearTimeout(timer);
+  }, [isOpen, initialValue]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <motion.form
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.95 }}
+        onSubmit={(e) => {
+          e.preventDefault();
+          onConfirm(value);
+        }}
+        className="bg-[#09090b] border border-white/10 rounded-2xl shadow-2xl max-w-md w-full overflow-hidden"
+      >
+        <div className="p-6">
+          <h3 className="text-lg font-semibold text-white mb-1 flex items-center gap-2">
+            <Pencil size={18} className="text-indigo-400" /> Rename file
+          </h3>
+          <p className="text-xs text-zinc-500 mb-4">
+            The extension is kept unless you type a new one.
+          </p>
+          <input
+            ref={inputRef}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            spellCheck={false}
+            className="w-full px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-700 text-sm font-mono text-zinc-100 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20"
+          />
+        </div>
+        <div className="bg-white/5 px-6 py-4 flex justify-end gap-3">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={onCancel}
+            className="text-sm h-9 px-4 text-zinc-400 hover:text-white hover:bg-white/5"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            className="bg-indigo-600 text-white hover:bg-indigo-500 border-none h-9 px-6 text-sm font-semibold"
+          >
+            Rename
+          </Button>
+        </div>
+      </motion.form>
+    </div>
+  );
+};
+
+// --- ALERT POPUP ---
 
 const AlertPopup = ({ isOpen, onClose, onConfirm, title, description }) => {
   if (!isOpen) return null;
@@ -1010,12 +1088,18 @@ function App() {
   const [stateLoaded, setStateLoaded] = useState(false);
   const cardSizeDef = CARD_SIZES[cardSize] ?? CARD_SIZES[DEFAULT_CARD_SIZE];
 
+  // Custom folder shortcuts (path -> key). Empty means "use the default
+  // keyboard-order slots".
+  const [folderKeys, setFolderKeys] = useState({});
+  const [rebindingPath, setRebindingPath] = useState(null);
+  const [renaming, setRenaming] = useState(null); // { filename, value }
+
   useEffect(() => {
     localStorage.setItem("mediasort_shortcuts", JSON.stringify(shortcuts));
   }, [shortcuts]);
 
   // Restore the last session once on startup: source folder, destination
-  // folders and dock preferences all come back automatically.
+  // folders, dock preferences and any custom folder shortcuts.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1033,6 +1117,9 @@ function App() {
         if (DOCK_ROW_OPTIONS.includes(state.dock_rows)) {
           setDockRows(state.dock_rows);
         }
+        if (state.folder_keys && Object.keys(state.folder_keys).length) {
+          setFolderKeys(state.folder_keys);
+        }
       }
       setStateLoaded(true);
     })();
@@ -1040,6 +1127,30 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  // Keep the shortcut map in step with the folder list: drop removed folders and
+  // hand newcomers the first free slot key.
+  useEffect(() => {
+    setFolderKeys((prev) => {
+      if (!Object.keys(prev).length) return prev; // still on the defaults
+      const next = {};
+      const used = new Set();
+      destinations.forEach((path) => {
+        if (prev[path]) {
+          next[path] = prev[path];
+          used.add(prev[path]);
+        }
+      });
+      destinations.forEach((path) => {
+        if (next[path]) return;
+        const free = DESTINATION_KEY_ORDER.find((key) => !used.has(key));
+        if (!free) return;
+        next[path] = free;
+        used.add(free);
+      });
+      return next;
+    });
+  }, [destinations]);
 
   // Persist whenever the session changes. Guarded by stateLoaded, so the
   // restore pass cannot overwrite the stored state with empty defaults.
@@ -1051,10 +1162,11 @@ function App() {
         destinations,
         card_size: cardSize,
         dock_rows: dockRows,
+        folder_keys: folderKeys,
       });
     }, 400);
     return () => clearTimeout(timer);
-  }, [stateLoaded, sourcePath, destinations, cardSize, dockRows]);
+  }, [stateLoaded, sourcePath, destinations, cardSize, dockRows, folderKeys]);
 
   const imageRef = useRef(null);
   const thumbnailRefs = useRef([]); // Ensure initialized
@@ -1159,6 +1271,26 @@ function App() {
     if (history.length === 0) return;
 
     const lastAction = history[history.length - 1];
+
+    // A rename is undone in place: the file keeps its position in the list.
+    if (lastAction.type === "rename") {
+      const undo = await callApi(
+        "rename_image",
+        lastAction.to,
+        sourcePath,
+        lastAction.from,
+      );
+      if (undo && undo.success) {
+        setHistory((prev) => prev.slice(0, -1));
+        setImages((prev) =>
+          prev.map((f) => (f === lastAction.to ? lastAction.from : f)),
+        );
+      } else {
+        alert("Undo failed: " + (undo?.error || "Unknown error"));
+      }
+      return;
+    }
+
     let res;
 
     if (lastAction.type === "move") {
@@ -1213,6 +1345,101 @@ function App() {
 
   // Moves one file into a destination folder. Works for the current preview as
   // well as for any thumbnail dragged out of the carousel.
+  // --- Folder shortcut rebinding -------------------------------------------
+
+  // Badge label for a folder: a custom binding wins, otherwise the default
+  // keyboard-order slot for that position.
+  const keyForDestination = (path, index) =>
+    folderKeys[path] ?? shortcutLabelForIndex(index);
+
+  // Which folder a pressed key selects (custom bindings win), or null.
+  const destinationForKeyChar = (char) => {
+    if (!char) return null;
+    if (Object.keys(folderKeys).length) {
+      return destinations.find((path) => folderKeys[path] === char) ?? null;
+    }
+    const index = DESTINATION_KEY_ORDER.indexOf(char);
+    if (index < 0 || index >= destinations.length) return null;
+    return destinations[index];
+  };
+
+  // Bind a key to a folder. Whoever held that key takes over the folder's old
+  // key instead, so no folder ends up without a shortcut.
+  const rebindFolderKey = (path, nextKey) => {
+    setFolderKeys((prev) => {
+      const base = Object.keys(prev).length
+        ? { ...prev }
+        : Object.fromEntries(
+            destinations
+              .map((p, i) => [p, shortcutLabelForIndex(i)])
+              .filter(([, key]) => key),
+          );
+      const currentKey = base[path];
+      const holder = Object.keys(base).find(
+        (other) => other !== path && base[other] === nextKey,
+      );
+      base[path] = nextKey;
+      if (holder) {
+        if (currentKey) base[holder] = currentKey;
+        else delete base[holder];
+      }
+      return base;
+    });
+  };
+
+  // Stop the viewer streaming a clip before the backend touches it: a playing
+  // video keeps a Windows lock, and the move/rename would fail with WinError 32.
+  const releaseMediaHandle = async (filename) => {
+    const video = videoRef.current;
+    if (!video || video.paused || !isVideoFilename(filename)) return;
+    try {
+      video.pause();
+    } catch {
+      /* the element may already be gone */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  };
+
+  // --- Rename --------------------------------------------------------------
+
+  const handleRenameClick = () => {
+    const filename = images[currentIndex];
+    if (!filename) return;
+    setRenaming({ filename, value: filename });
+  };
+
+  const confirmRename = async (newName) => {
+    const target = renaming;
+    setRenaming(null);
+    if (!target) return;
+    const trimmed = (newName || "").trim();
+    if (!trimmed || trimmed === target.filename) return;
+
+    await releaseMediaHandle(target.filename);
+    const res = await callApi(
+      "rename_image",
+      target.filename,
+      sourcePath,
+      trimmed,
+    );
+    if (!res || !res.success) {
+      alert(
+        res?.busy
+          ? "Rename failed: the file is still in use. Try again in a moment."
+          : "Rename failed: " + (res?.error || "Unknown error"),
+      );
+      return;
+    }
+    const newFilename = res.filename || trimmed;
+    setHistory((prev) => [
+      ...prev,
+      { type: "rename", from: target.filename, to: newFilename },
+    ]);
+    setImages((prev) =>
+      prev.map((f) => (f === target.filename ? newFilename : f)),
+    );
+  };
+
   const moveFileToDestination = async (destPath, filename, fileIndex) => {
     if (!destPath || !filename) return;
 
@@ -1221,6 +1448,9 @@ function App() {
         ? fileIndex
         : images.indexOf(filename);
     if (index < 0) return;
+
+    // Pause the preview if it is the clip being filed away.
+    if (index === currentIndex) await releaseMediaHandle(filename);
 
     const res = await callApi("move_image", filename, sourcePath, destPath);
 
@@ -1237,7 +1467,11 @@ function App() {
         return prev;
       });
     } else {
-      alert("Failed to move file: " + (res?.error || "Unknown error"));
+      alert(
+        res?.busy
+          ? "Failed to move file: it is still in use (it may still be playing). Try again in a moment."
+          : "Failed to move file: " + (res?.error || "Unknown error"),
+      );
     }
   };
 
@@ -1395,6 +1629,22 @@ function App() {
 
   useEffect(() => {
     const handleKey = (e) => {
+      // While a folder badge waits for its new key, that press is consumed by
+      // the binding instead of triggering anything else.
+      if (rebindingPath) {
+        e.preventDefault();
+        if (e.key === "Escape") {
+          setRebindingPath(null);
+          return;
+        }
+        const char = keyCharFromEvent(e);
+        if (char) {
+          rebindFolderKey(rebindingPath, char);
+          setRebindingPath(null);
+        }
+        return;
+      }
+
       // Ignore if typing in an input (if we had any) or if settings open
       if (showSettings) return;
 
@@ -1416,26 +1666,38 @@ function App() {
       if (matchesAction(shortcuts.prev)) handlePrev();
       if (matchesAction(shortcuts.delete)) handleDeleteClick();
 
+      // Rename the file currently being previewed.
+      if (e.key === "F2") {
+        e.preventDefault();
+        handleRenameClick();
+        return;
+      }
+
       // Modifier combos (Ctrl+1, Alt+3...) belong to the host application.
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
       // A key already bound to Next/Previous/Delete keeps that meaning.
       if (isKeyReservedForAction(keyCharFromEvent(e), shortcuts)) return;
 
-      // 1..9 -> cards 1..9, 0 -> card 10, then QWERTYUIOP / ASDFGHJKL / ZXCVBNM.
-      const destIndex = destinationIndexForKey(e);
-      if (destIndex >= 0 && destIndex < destinations.length) {
+      // Custom bindings come first, otherwise the keyboard-order slots apply.
+      const target = destinationForKeyChar(keyCharFromEvent(e));
+      if (target) {
         e.preventDefault();
-        moveFileToDestination(
-          destinations[destIndex],
-          images[currentIndex],
-          currentIndex,
-        );
+        moveFileToDestination(target, images[currentIndex], currentIndex);
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [destinations, currentIndex, images, history, shortcuts, showSettings]);
+  }, [
+    destinations,
+    currentIndex,
+    images,
+    history,
+    shortcuts,
+    showSettings,
+    rebindingPath,
+    folderKeys,
+  ]);
 
   // --- Render ---
 
@@ -1545,6 +1807,17 @@ function App() {
             variant="ghost"
           >
             <RotateCcw size={18} />
+          </Button>
+
+          {/* Rename Button */}
+          <Button
+            onClick={handleRenameClick}
+            disabled={!images.length}
+            className="!p-2.5 w-10 h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-gray-400 hover:text-white disabled:opacity-20 transition-all"
+            title="Rename File (F2)"
+            variant="ghost"
+          >
+            <Pencil size={18} />
           </Button>
 
           {/* Delete Button */}
@@ -1968,6 +2241,9 @@ function App() {
                 isDropTarget={dragOverPath === path}
                 innerRef={(el) => registerDestinationRef(path, el)}
                 shortcuts={shortcuts}
+                keyLabel={keyForDestination(path, idx)}
+                isRebinding={rebindingPath === path}
+                onRebindKey={setRebindingPath}
                 sizeDef={cardSizeDef}
               />
             ))}
@@ -2029,6 +2305,13 @@ function App() {
           </div>
         </div>
       )}
+
+      <RenameDialog
+        isOpen={!!renaming}
+        initialValue={renaming?.value ?? ""}
+        onCancel={() => setRenaming(null)}
+        onConfirm={confirmRename}
+      />
 
       <AlertPopup
         isOpen={showDeleteAlert}

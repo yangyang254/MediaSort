@@ -1,7 +1,9 @@
 import os
+import re
 import shutil
 import base64
 import json
+import mimetypes
 import time
 import webview
 from threading import Thread
@@ -32,20 +34,57 @@ if getattr(sys, "frozen", False):
         pass
 
 # --- Persistent state --------------------------------------------------------
-# The last session (source folder + destination folders) and the dock
-# preferences live in a small JSON file, so the next launch can restore them.
-STATE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MediaSort"
-)
-STATE_FILE = os.path.join(STATE_DIR, "settings.json")
+# The session (source folder + destination folders), the dock preferences and any
+# custom folder shortcuts live in a small JSON file, so the next launch can
+# restore them. Packaged builds keep it beside the executable, which makes the
+# whole thing a portable folder that can be copied to another machine.
 CARD_SIZES = ("small", "medium", "large")
 DOCK_ROWS = (1, 2, 3)
+VALID_KEY_CHARS = "1234567890qwertyuiopasdfghjklzxcvbnm"
 DEFAULT_STATE = {
     "source": None,
     "destinations": [],
     "card_size": "medium",
     "dock_rows": 2,
+    "folder_keys": {},
 }
+
+
+def is_writable_dir(directory):
+    """True when we can actually create files in `directory`."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".write-test.tmp")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_state_dir():
+    """Portable first, %LOCALAPPDATA% as the fallback.
+
+    Beside the exe is preferred so a copy of the folder carries the history with
+    it; that fails when MediaSort is installed somewhere read-only.
+    """
+    if getattr(sys, "frozen", False):
+        beside_app = os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), "MediaSort.data"
+        )
+        if is_writable_dir(beside_app):
+            return beside_app
+    fallback = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MediaSort"
+    )
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+STATE_DIR = resolve_state_dir()
+STATE_FILE = os.path.join(STATE_DIR, "settings.json")
+print(f"API: state file -> {STATE_FILE}")
 
 
 def clean_state(raw):
@@ -76,7 +115,44 @@ def clean_state(raw):
         rows = DEFAULT_STATE["dock_rows"]
     if rows in DOCK_ROWS:
         state["dock_rows"] = rows
+
+    # Custom folder shortcuts, kept only for folders that still exist.
+    folder_keys = {}
+    for path, key in (raw.get("folder_keys") or {}).items():
+        if (
+            isinstance(path, str)
+            and path in seen
+            and isinstance(key, str)
+            and len(key) == 1
+            and key.lower() in VALID_KEY_CHARS
+        ):
+            folder_keys[path] = key.lower()
+    state["folder_keys"] = folder_keys
     return state
+
+
+def move_with_retry(src_path, dest_path, attempts=24, delay=0.25):
+    """Move/rename a file, retrying while Windows still holds it open.
+
+    The viewer (and the streaming thread) can keep a file locked for a moment
+    after a video starts playing, which shows up as a sharing violation
+    (WinError 32). Retrying for a few seconds turns those transient failures
+    into successful sorts.
+
+    Returns (ok, error_message, busy).
+    """
+    last_err = None
+    for _ in range(attempts):
+        try:
+            shutil.move(src_path, dest_path)
+            return True, None, False
+        except OSError as e:
+            last_err = e
+            if getattr(e, "winerror", 32) != 32 and getattr(e, "errno", None) != 13:
+                break
+            time.sleep(delay)
+    busy = getattr(last_err, "winerror", None) == 32
+    return False, str(last_err), busy
 
 
 # --- Flask Server for Streaming ---
@@ -123,9 +199,61 @@ def serve_file():
 
 @server.route('/video')
 def serve_video():
+    """Stream a video in chunks, honouring Range requests.
+
+    flask's send_file keeps the file open for the whole transfer, and on Windows
+    an open handle blocks renaming/moving that file (WinError 32) - which is why
+    sorting the clip that was still playing used to fail. Opening the file once
+    per chunk keeps the lock window tiny, so a move almost always wins.
+    """
     path = request.args.get('path')
-    if not path: return "No path", 400
-    return send_file(path)
+    if not path or not os.path.exists(path):
+        return "File not found", 404
+
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return str(e), 500
+
+    start, end = 0, size - 1
+    status = 200
+    range_header = request.headers.get('Range')
+    if range_header:
+        match = re.match(r'bytes=(\d*)-(\d*)', range_header)
+        if match:
+            if match.group(1):
+                start = int(match.group(1))
+            if match.group(2):
+                end = min(int(match.group(2)), size - 1)
+            if start > end or start >= size:
+                return Response(status=416)
+            status = 206
+
+    length = max(0, end - start + 1)
+    chunk_size = 256 * 1024
+
+    def generate():
+        position = start
+        remaining = length
+        while remaining > 0:
+            # The handle only lives for the length of one read.
+            with open(path, 'rb') as handle:
+                handle.seek(position)
+                data = handle.read(min(chunk_size, remaining))
+            if not data:
+                break
+            position += len(data)
+            remaining -= len(data)
+            yield data
+
+    headers = {
+        'Content-Length': str(length),
+        'Accept-Ranges': 'bytes',
+        'Content-Type': mimetypes.guess_type(path)[0] or 'application/octet-stream',
+    }
+    if status == 206:
+        headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    return Response(generate(), status=status, headers=headers)
 
 @lru_cache(maxsize=1000)
 def get_thumbnail_bytes(path):
@@ -521,20 +649,49 @@ class Api:
             if not os.path.exists(dest_folder):
                 os.makedirs(dest_folder)
 
-            # Windows keeps a file locked while the viewer (or the Flask
-            # streaming thread) still reads it, so a move can transiently fail
-            # with a sharing violation. Retry briefly instead of giving up.
-            last_err = None
-            for _ in range(8):
-                try:
-                    shutil.move(src_path, dest_path)
-                    return {"success": True}
-                except OSError as e:
-                    last_err = e
-                    if getattr(e, "winerror", 32) != 32:
-                        break
-                    time.sleep(0.35)
-            return {"success": False, "error": str(last_err)}
+            # Windows keeps a file locked while the viewer (or the streaming
+            # thread) still reads it, so a move can transiently fail with a
+            # sharing violation. move_with_retry rides that out.
+            ok, error, busy = move_with_retry(src_path, dest_path)
+            if ok:
+                return {"success": True}
+            return {"success": False, "error": error, "busy": busy}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def rename_image(self, filename, src_folder, new_name):
+        """Rename a file inside the source folder.
+
+        The original extension is kept unless the new name carries its own, and
+        the same retry loop as move_image is used so renaming the clip that is
+        currently playing works too.
+        """
+        try:
+            new_name = (new_name or "").strip()
+            if not new_name:
+                return {"success": False, "error": "Name cannot be empty"}
+
+            _, ext = os.path.splitext(filename)
+            if not os.path.splitext(new_name)[1]:
+                new_name += ext
+
+            if new_name in (".", "..") or any(c in new_name for c in '<>:"/\\|?*'):
+                return {"success": False, "error": "Name contains invalid characters"}
+
+            src_path = os.path.join(src_folder, filename)
+            dest_path = os.path.join(src_folder, new_name)
+
+            if not os.path.exists(src_path):
+                return {"success": False, "error": "File not found"}
+            if os.path.normcase(src_path) == os.path.normcase(dest_path):
+                return {"success": True, "filename": filename}
+            if os.path.exists(dest_path):
+                return {"success": False, "error": "A file with that name already exists"}
+
+            ok, error, busy = move_with_retry(src_path, dest_path)
+            if ok:
+                return {"success": True, "filename": new_name}
+            return {"success": False, "error": error, "busy": busy}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -549,8 +706,10 @@ class Api:
             dest_path = os.path.join(trash_path, filename)
             
             if os.path.exists(src_path):
-                shutil.move(src_path, dest_path)
-                return {"success": True}
+                ok, error, busy = move_with_retry(src_path, dest_path)
+                if ok:
+                    return {"success": True}
+                return {"success": False, "error": error, "busy": busy}
             else:
                 return {"success": False, "error": "File not found"}
         except Exception as e:
@@ -564,8 +723,10 @@ class Api:
             dest_path = os.path.join(src_folder, filename) # Moving back to original source
             
             if os.path.exists(src_path):
-                shutil.move(src_path, dest_path)
-                return {"success": True}
+                ok, error, busy = move_with_retry(src_path, dest_path)
+                if ok:
+                    return {"success": True}
+                return {"success": False, "error": error, "busy": busy}
             else:
                 return {"success": False, "error": "File in trash not found"}
         except Exception as e:
