@@ -1,6 +1,8 @@
 import os
 import shutil
 import base64
+import json
+import time
 import webview
 from threading import Thread
 import sys
@@ -9,6 +11,73 @@ import datetime
 from flask import Flask, send_file, request, Response
 from flask_cors import CORS
 from functools import lru_cache
+
+# A PyInstaller windowed build has no console: sys.stdout/sys.stderr are either
+# None or throw-away streams, so the diagnostic print() calls sprinkled through
+# the pywebview bridge below would crash or vanish. Point them at a log file
+# (%TEMP%\MediaSort.log); plain `python app.py` keeps using the console.
+if getattr(sys, "frozen", False):
+    import tempfile
+
+    try:
+        _log_stream = open(
+            os.path.join(tempfile.gettempdir(), "MediaSort.log"),
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
+        sys.stdout = _log_stream
+        sys.stderr = _log_stream
+    except Exception:
+        pass
+
+# --- Persistent state --------------------------------------------------------
+# The last session (source folder + destination folders) and the dock
+# preferences live in a small JSON file, so the next launch can restore them.
+STATE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "MediaSort"
+)
+STATE_FILE = os.path.join(STATE_DIR, "settings.json")
+CARD_SIZES = ("small", "medium", "large")
+DOCK_ROWS = (1, 2, 3)
+DEFAULT_STATE = {
+    "source": None,
+    "destinations": [],
+    "card_size": "medium",
+    "dock_rows": 2,
+}
+
+
+def clean_state(raw):
+    """Coerce whatever is on disk into a safe, well-formed state object."""
+    state = dict(DEFAULT_STATE)
+    if not isinstance(raw, dict):
+        return state
+
+    source = raw.get("source")
+    if isinstance(source, str) and os.path.isdir(source):
+        state["source"] = source
+
+    destinations = []
+    seen = set()
+    for path in raw.get("destinations") or []:
+        # Dead paths are dropped: keeping one would let a later move silently
+        # recreate a folder the user deleted on purpose.
+        if isinstance(path, str) and path not in seen and os.path.isdir(path):
+            seen.add(path)
+            destinations.append(path)
+    state["destinations"] = destinations
+
+    if raw.get("card_size") in CARD_SIZES:
+        state["card_size"] = raw["card_size"]
+    try:
+        rows = int(raw.get("dock_rows"))
+    except (TypeError, ValueError):
+        rows = DEFAULT_STATE["dock_rows"]
+    if rows in DOCK_ROWS:
+        state["dock_rows"] = rows
+    return state
+
 
 # --- Flask Server for Streaming ---
 server = Flask(__name__)
@@ -143,6 +212,49 @@ class Api:
 
     def set_window(self, window):
         self._window = window
+
+    def load_state(self):
+        """Return the persisted session and UI preferences.
+
+        Called once on startup so the previous source folder, destination
+        folders and dock settings come back automatically.
+        """
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except FileNotFoundError:
+            print("API: load_state -> no state file yet")
+            return dict(DEFAULT_STATE)
+        except Exception as e:
+            print(f"API: Could not read {STATE_FILE}: {e}")
+            return dict(DEFAULT_STATE)
+        state = clean_state(raw)
+        print(
+            "API: load_state -> "
+            f"source={state['source']} destinations={len(state['destinations'])} "
+            f"card={state['card_size']} rows={state['dock_rows']}"
+        )
+        return state
+
+    def save_state(self, state):
+        """Persist the session and UI preferences. Written atomically so a crash
+        cannot leave a half-written file behind."""
+        try:
+            cleaned = clean_state(state)
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp_path = STATE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(cleaned, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, STATE_FILE)
+            print(
+                "API: save_state <- "
+                f"source={cleaned['source']} destinations={len(cleaned['destinations'])} "
+                f"card={cleaned['card_size']} rows={cleaned['dock_rows']}"
+            )
+            return {"success": True}
+        except Exception as e:
+            print(f"API: Could not write {STATE_FILE}: {e}")
+            return {"success": False, "error": str(e)}
 
     def select_folder(self):
         """Open a folder selection dialog and return the path."""
@@ -408,9 +520,21 @@ class Api:
             # Ensure dest folder exists
             if not os.path.exists(dest_folder):
                 os.makedirs(dest_folder)
-                
-            shutil.move(src_path, dest_path)
-            return {"success": True}
+
+            # Windows keeps a file locked while the viewer (or the Flask
+            # streaming thread) still reads it, so a move can transiently fail
+            # with a sharing violation. Retry briefly instead of giving up.
+            last_err = None
+            for _ in range(8):
+                try:
+                    shutil.move(src_path, dest_path)
+                    return {"success": True}
+                except OSError as e:
+                    last_err = e
+                    if getattr(e, "winerror", 32) != 32:
+                        break
+                    time.sleep(0.35)
+            return {"success": False, "error": str(last_err)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -480,11 +604,15 @@ def start_app():
 
     # Enable File Access (Attempt to fix video playback)
     # Note: These flags depend on the underlying browser engine (CEF/WebView2/etc)
+    # pywebview's settings dict only accepts keys it already exposes (assigning
+    # private_mode there raises), so persistent storage has to be requested
+    # through webview.start() below. Without this the WebView2 profile - and
+    # with it localStorage - is thrown away on exit.
     try:
         webview.settings['ALLOW_FILE_ACCESS_FROM_FILES'] = True
         webview.settings['ALLOW_UNIVERSAL_ACCESS_FROM_FILES'] = True
-    except Exception:
-        pass # Settings might not exist in some versions
+    except Exception as e:
+        print(f"API: Could not relax local file access: {e}")
 
     window = webview.create_window(
         'MediaSort', 
@@ -495,7 +623,14 @@ def start_app():
         background_color='#0f172a' # Match the theme
     )
     api.set_window(window)
-    webview.start(debug=False)
+    # private_mode=False keeps cookies/localStorage between runs; the storage
+    # path lives next to the state file so everything MediaSort persists is in
+    # one place.
+    webview.start(
+        debug=False,
+        private_mode=False,
+        storage_path=os.path.join(STATE_DIR, "webview"),
+    )
 
 if __name__ == '__main__':
     start_app()

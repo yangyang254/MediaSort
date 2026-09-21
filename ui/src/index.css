@@ -28,3 +28,20 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #475569;
 }
+
+/* --- Drag a preview onto a destination folder --- */
+body.mediasort-dragging {
+  cursor: grabbing;
+}
+
+body.mediasort-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+/* Native element dragging would steal the pointer stream from the sort gesture. */
+img,
+video {
+  -webkit-user-drag: none;
+  user-drag: none;
+}

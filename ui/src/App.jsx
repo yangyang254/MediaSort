@@ -33,6 +33,7 @@ import {
   Video,
   Play,
   ArrowUpDown,
+  LayoutGrid,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -86,13 +87,18 @@ const ZoomableImage = forwardRef(({ src, alt }, ref) => {
       onWheel={handleWheel}
       onPointerDown={(e) => {
         if (scale > 1) {
+          // Panning a zoomed image wins over the "drag to folder" gesture.
+          e.stopPropagation();
           dragControls.start(e);
         }
       }}
       style={{ touchAction: "none" }}
     >
       {/* Controls */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 bg-black/60 backdrop-blur-md rounded-full border border-white/10 opacity-0 hover:opacity-100 transition-opacity z-50">
+      <div
+        className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2 bg-black/60 backdrop-blur-md rounded-full border border-white/10 opacity-0 hover:opacity-100 transition-opacity z-50"
+        data-no-drag
+      >
         <button
           className="p-1.5 hover:text-blue-400 text-white transition active:scale-90"
           onClick={(e) => {
@@ -147,6 +153,9 @@ const ZoomableImage = forwardRef(({ src, alt }, ref) => {
             scale > 1 ? "0 20px 50px -12px rgba(0, 0, 0, 0.5)" : "none",
         }}
         transition={{ type: "spring", stiffness: 300, damping: 30 }}
+        // Native image dragging would hijack the pointer stream.
+        draggable={false}
+        onDragStart={(e) => e.preventDefault()}
         drag={scale > 1}
         dragListener={false}
         dragControls={dragControls}
@@ -218,7 +227,156 @@ const MetadataPanel = ({ data, onClose }) => {
   );
 };
 
+// --- DESTINATION SHORTCUTS & DRAG HELPERS ---
+
+// Destination shortcuts follow keyboard reading order: the number row (1..9 then
+// 0), then QWERTYUIOP, ASDFGHJKL and ZXCVBNM. Cards past this list get no key.
+const DESTINATION_KEY_ORDER = [
+  "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+  "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
+  "a", "s", "d", "f", "g", "h", "j", "k", "l",
+  "z", "x", "c", "v", "b", "n", "m",
+];
+
+// Label shown on the card badge; null means "no keyboard shortcut".
+const shortcutLabelForIndex = (index) => DESTINATION_KEY_ORDER[index] ?? null;
+
+// The printable character a key event stands for, lower-cased. Physical key
+// codes are checked first, so caps lock, shift and IME state cannot change which
+// folder a press selects. Numpad digits map to the same slots as the top row.
+const keyCharFromEvent = (e) => {
+  const code = e.code || "";
+  const digit = /^(?:Digit|Numpad)([0-9])$/.exec(code);
+  if (digit) return digit[1];
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1].toLowerCase();
+
+  const key = e.key;
+  if (typeof key === "string" && key.length === 1) {
+    if (/[0-9]/.test(key)) return key;
+    if (/[a-zA-Z]/.test(key)) return key.toLowerCase();
+  }
+  return null;
+};
+
+// Index of the destination a key press selects, or -1 for "not a folder key".
+const destinationIndexForKey = (e) => {
+  const char = keyCharFromEvent(e);
+  return char === null ? -1 : DESTINATION_KEY_ORDER.indexOf(char);
+};
+
+// True when that key is also bound to Next/Previous/Delete in the settings.
+const isKeyReservedForAction = (label, shortcuts) => {
+  if (!label || !shortcuts) return false;
+  return Object.values(shortcuts).some(
+    (bound) =>
+      typeof bound === "string" && bound.toLowerCase() === label.toLowerCase(),
+  );
+};
+
+const VIDEO_EXTENSIONS = ["mp4", "mov", "avi", "mkv", "webm"];
+
+const isVideoFilename = (filename) =>
+  !!filename &&
+  VIDEO_EXTENSIONS.includes(filename.split(".").pop().toLowerCase());
+
+// Single place that builds local Flask URLs for a media file.
+const buildAssetUrl = (sourcePath, filename, endpoint) => {
+  if (!sourcePath || !filename) return null;
+  const sep = sourcePath.includes("\\") ? "\\" : "/";
+  const fullPath = `${sourcePath}${sep}${filename}`;
+  return `http://127.0.0.1:23456/${endpoint}?path=${encodeURIComponent(fullPath)}`;
+};
+
+// --- DOCK APPEARANCE ---
+
+// Folder card sizes offered in Settings. Class strings are written out in full
+// so Tailwind's scanner picks them up.
+const CARD_SIZES = {
+  small: {
+    key: "small",
+    label: "Small",
+    box: "w-20 h-[76px]",
+    height: 76,
+    iconSize: 12,
+    badge: "w-4 h-4 text-[8px]",
+    name: "text-[9px] line-clamp-4",
+    nameLong: "text-[8px] line-clamp-4",
+    innerGap: "gap-0.5",
+  },
+  medium: {
+    key: "medium",
+    label: "Medium",
+    box: "w-24 h-[88px]",
+    height: 88,
+    iconSize: 15,
+    badge: "w-5 h-5 text-[9px]",
+    name: "text-[10px] line-clamp-4",
+    nameLong: "text-[9px] line-clamp-4",
+    innerGap: "gap-1",
+  },
+  large: {
+    key: "large",
+    label: "Large",
+    box: "w-28 h-[104px]",
+    height: 104,
+    iconSize: 18,
+    badge: "w-5 h-5 text-[10px]",
+    name: "text-[11px] line-clamp-5",
+    nameLong: "text-[9px] line-clamp-5",
+    innerGap: "gap-1",
+  },
+};
+const DEFAULT_CARD_SIZE = "medium";
+const DOCK_ROW_OPTIONS = [1, 2, 3];
+const DEFAULT_DOCK_ROWS = 2;
+const DOCK_GAP_PX = 6;
+const DOCK_PADDING_PX = 24; // py-3 top and bottom
+const LONG_NAME_THRESHOLD = 24;
+
+// Pointer travel before a press turns into a drag (keeps plain clicks working).
+const DRAG_THRESHOLD_PX = 6;
+// Bottom strip of a <video> occupied by its native controls.
+const VIDEO_CONTROLS_STRIP_PX = 48;
+
+// Tears down the window listeners of an in-flight drag session.
+const releaseDragSession = (sessionRef) => {
+  const session = sessionRef.current;
+  if (!session) return;
+  window.removeEventListener("pointermove", session.move);
+  window.removeEventListener("pointerup", session.up);
+  window.removeEventListener("pointercancel", session.cancel);
+  window.removeEventListener("keydown", session.key);
+  if (session.raf) cancelAnimationFrame(session.raf);
+  sessionRef.current = null;
+  document.body.classList.remove("mediasort-dragging");
+};
+
 // --- API HANDLING ---
+
+// pywebview injects window.pywebview only after the page has loaded, so a call
+// made during the first render would silently fall back to the dev mocks (and
+// the session would never be restored). Wait for 'pywebviewready', with a
+// polling fallback in case the event already fired.
+const waitForBridge = (timeoutMs = 5000) =>
+  new Promise((resolve) => {
+    if (window.pywebview?.api) {
+      resolve(true);
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      resolve(!!window.pywebview?.api);
+    };
+    window.addEventListener("pywebviewready", finish, { once: true });
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (window.pywebview?.api || Date.now() - started >= timeoutMs) finish();
+    }, 100);
+  });
 
 const callApi = async (method, ...args) => {
   // Check dynamically because pywebview is injected asynchronously
@@ -240,6 +398,23 @@ const callApi = async (method, ...args) => {
     if (method === "move_image") return { success: true };
     if (method === "delete_image") return { success: true };
     if (method === "restore_image") return { success: true };
+    // Browser dev: emulate the backend state file with localStorage, so a page
+    // reload behaves like a real app restart.
+    if (method === "load_state") {
+      try {
+        return JSON.parse(localStorage.getItem("mediasort_state") || "null");
+      } catch {
+        return null;
+      }
+    }
+    if (method === "save_state") {
+      try {
+        localStorage.setItem("mediasort_state", JSON.stringify(args[0]));
+      } catch {
+        /* ignore quota errors in dev */
+      }
+      return { success: true };
+    }
     if (method === "get_image_metadata")
       return {
         resolution: "1920x1080",
@@ -257,7 +432,16 @@ const callApi = async (method, ...args) => {
 
 // --- SETTINGS POPUP ---
 
-const SettingsPopup = ({ isOpen, onClose, shortcuts, onSave }) => {
+const SettingsPopup = ({
+  isOpen,
+  onClose,
+  shortcuts,
+  onSave,
+  cardSize,
+  onCardSizeChange,
+  dockRows,
+  onDockRowsChange,
+}) => {
   const [localShortcuts, setLocalShortcuts] = useState(shortcuts);
   const [listening, setListening] = useState(null); // 'next', 'prev', 'delete'
 
@@ -301,7 +485,7 @@ const SettingsPopup = ({ isOpen, onClose, shortcuts, onSave }) => {
             <h2 className="text-xl font-semibold text-white tracking-tight flex items-center gap-2">
               <Settings className="text-indigo-500" size={20} />
               <span className="bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
-                Keyboard Shortcuts
+                Settings
               </span>
             </h2>
           </div>
@@ -312,6 +496,55 @@ const SettingsPopup = ({ isOpen, onClose, shortcuts, onSave }) => {
             <X size={20} />
           </button>
         </div>
+
+        {/* Dock appearance: applies immediately, no need to hit Save. */}
+        <div className="mb-6">
+          <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-3 flex items-center gap-2">
+            <LayoutGrid size={14} className="text-indigo-400" /> Folder Cards
+          </h3>
+
+          <div className="text-xs text-zinc-500 mb-1.5">Card size</div>
+          <div className="flex gap-2 mb-4">
+            {Object.values(CARD_SIZES).map((size) => (
+              <button
+                key={size.key}
+                onClick={() => onCardSizeChange(size.key)}
+                className={clsx(
+                  "flex-1 px-3 py-2 rounded-lg text-xs font-semibold border transition-all",
+                  cardSize === size.key
+                    ? "bg-indigo-500/15 border-indigo-500/50 text-indigo-300"
+                    : "bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500",
+                )}
+              >
+                {size.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="text-xs text-zinc-500 mb-1.5">
+            Rows in the folder dock
+          </div>
+          <div className="flex gap-2">
+            {DOCK_ROW_OPTIONS.map((rows) => (
+              <button
+                key={rows}
+                onClick={() => onDockRowsChange(rows)}
+                className={clsx(
+                  "flex-1 px-3 py-2 rounded-lg text-xs font-semibold border transition-all",
+                  dockRows === rows
+                    ? "bg-indigo-500/15 border-indigo-500/50 text-indigo-300"
+                    : "bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500",
+                )}
+              >
+                {rows === 1 ? "1 (scroll)" : rows}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-500 mb-3 pt-6 border-t border-white/5">
+          Keyboard Shortcuts
+        </h3>
 
         <div className="space-y-1">
           {[
@@ -436,32 +669,89 @@ const IconButton = ({
   );
 };
 
-const DestinationCard = ({ path, index, onClick, onRemove }) => {
+const DestinationCard = ({
+  path,
+  index,
+  onClick,
+  onRemove,
+  isDropTarget,
+  innerRef,
+  shortcuts,
+  sizeDef = CARD_SIZES[DEFAULT_CARD_SIZE],
+}) => {
   const parts = path.split(/[/\\]/);
   const name = parts[parts.length - 1] || path;
+  const shortcutLabel = shortcutLabelForIndex(index);
+  // A key already used by Next/Previous/Delete cannot also pick a folder.
+  const shortcutTaken = isKeyReservedForAction(shortcutLabel, shortcuts);
+  const activeShortcut = shortcutLabel && !shortcutTaken ? shortcutLabel : null;
 
   return (
     <motion.div
+      ref={innerRef}
       layout
       initial={{ opacity: 0, scale: 0.8 }}
-      animate={{ opacity: 1, scale: 1 }}
+      animate={{ opacity: 1, scale: isDropTarget ? 1.05 : 1 }}
       exit={{ opacity: 0, scale: 0.8 }}
       onClick={onClick}
-      className="group relative flex-shrink-0 w-40 h-32 cursor-pointer"
+      className={clsx("group relative flex-shrink-0 cursor-pointer", sizeDef.box)}
     >
-      <div className="absolute inset-0 bg-[#0f0f0f] hover:bg-[#151520] rounded-2xl border border-white/5 hover:border-indigo-500/50 shadow-lg hover:shadow-indigo-500/20 transition-all duration-300"></div>
+      <div
+        className={clsx(
+          "absolute inset-0 rounded-xl border shadow-lg transition-all duration-300",
+          isDropTarget
+            ? "bg-emerald-500/10 border-emerald-400/80 ring-2 ring-emerald-400/40 shadow-emerald-500/25"
+            : "bg-[#0f0f0f] hover:bg-[#151520] border-white/5 hover:border-indigo-500/50 hover:shadow-indigo-500/20",
+        )}
+      ></div>
 
       {/* Shortcut Indicator */}
-      <div className="absolute top-2 left-2 w-6 h-6 rounded-lg bg-white/5 border border-white/5 flex items-center justify-center text-[10px] font-bold text-gray-500 group-hover:text-indigo-400 group-hover:bg-indigo-500/10 group-hover:border-indigo-500/20 transition-colors">
-        {index + 1}
+      <div
+        title={
+          activeShortcut
+            ? `Press ${activeShortcut.toUpperCase()} to move here`
+            : shortcutTaken
+              ? `${shortcutLabel.toUpperCase()} is bound to another action`
+              : "No keyboard shortcut"
+        }
+        className={clsx(
+          "absolute top-1 left-1 rounded-md border flex items-center justify-center font-bold uppercase transition-colors z-10",
+          sizeDef.badge,
+          isDropTarget
+            ? "bg-emerald-400 border-emerald-300 text-emerald-950"
+            : activeShortcut
+              ? "bg-white/5 border-white/5 text-gray-500 group-hover:text-indigo-400 group-hover:bg-indigo-500/10 group-hover:border-indigo-500/20"
+              : "bg-white/5 border-white/5 text-gray-700",
+        )}
+      >
+        {activeShortcut ?? index + 1}
       </div>
 
-      {/* Content */}
-      <div className="absolute inset-0 flex flex-col items-center justify-center p-4 text-center">
-        <div className="mb-3 p-2.5 bg-gradient-to-br from-indigo-500/10 to-violet-500/10 rounded-xl text-gray-400 group-hover:text-white group-hover:from-indigo-500 group-hover:to-violet-500 shadow-inner group-hover:shadow-lg transition-all duration-300 transform group-hover:-translate-y-1">
-          <Folder size={24} />
+      {/* Drop hint */}
+      {isDropTarget && (
+        <div className="absolute inset-x-0 bottom-0 py-1 rounded-b-xl bg-emerald-400/90 text-emerald-950 text-[9px] font-bold uppercase tracking-wider text-center z-10">
+          Drop to move
         </div>
-        <span className="text-xs font-semibold text-gray-400 group-hover:text-gray-100 line-clamp-2 leading-tight break-all max-w-full transition-colors">
+      )}
+
+      {/* Content: the full folder name must stay readable, so it wraps and steps
+          down a size for long names. */}
+      <div
+        className={clsx(
+          "absolute inset-0 flex flex-col items-center justify-center px-1.5 py-1.5 text-center",
+          sizeDef.innerGap,
+        )}
+      >
+        <div className="p-1.5 bg-gradient-to-br from-indigo-500/10 to-violet-500/10 rounded-lg text-gray-400 group-hover:text-white group-hover:from-indigo-500 group-hover:to-violet-500 shadow-inner group-hover:shadow-lg transition-all duration-300 transform group-hover:-translate-y-0.5 flex-shrink-0">
+          <Folder size={sizeDef.iconSize} />
+        </div>
+        <span
+          title={name}
+          className={clsx(
+            "font-semibold text-gray-400 group-hover:text-gray-100 leading-[1.15] break-all w-full transition-colors",
+            name.length > LONG_NAME_THRESHOLD ? sizeDef.nameLong : sizeDef.name,
+          )}
+        >
           {name}
         </span>
       </div>
@@ -472,9 +762,9 @@ const DestinationCard = ({ path, index, onClick, onRemove }) => {
           e.stopPropagation();
           onRemove(path);
         }}
-        className="absolute -top-2 -right-2 w-7 h-7 bg-[#1a1a1a] border border-white/10 hover:bg-red-500 hover:border-red-400 text-gray-400 hover:text-white rounded-full flex items-center justify-center shadow-xl opacity-0 group-hover:opacity-100 scale-75 group-hover:scale-100 transition-all duration-200 z-10"
+        className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-[#1a1a1a] border border-white/10 hover:bg-red-500 hover:border-red-400 text-gray-400 hover:text-white rounded-full flex items-center justify-center shadow-xl opacity-0 group-hover:opacity-100 scale-75 group-hover:scale-100 transition-all duration-200 z-10"
       >
-        <X size={12} />
+        <X size={10} />
       </button>
     </motion.div>
   );
@@ -545,18 +835,16 @@ const FilterPopup = ({ filters, onToggle, onClose }) => {
 
 // --- THUMBNAIL COMPONENT ---
 
-const Thumbnail = ({ filename, sourcePath, current, onClick }) => {
+const Thumbnail = ({ filename, sourcePath, current, onClick, onPointerDown }) => {
   const isActive = current;
 
-  const sep = sourcePath.includes("\\") ? "\\" : "/";
-  // Double encode if needed? No, Flask request.args handles URL decoding once.
-  // encodeURIComponent creates valid generic URL.
-  const fullPath = `${sourcePath}${sep}${filename}`;
-  const src = `http://127.0.0.1:23456/thumbnail?path=${encodeURIComponent(fullPath)}`;
+  // Flask decodes request.args exactly once, so a single encodeURIComponent suffices.
+  const src = buildAssetUrl(sourcePath, filename, "thumbnail");
 
   return (
     <div
       onClick={onClick}
+      onPointerDown={onPointerDown}
       className={clsx(
         "flex-shrink-0 w-20 h-20 rounded-lg overflow-hidden border-2 cursor-pointer transition-all relative group",
         isActive
@@ -569,6 +857,8 @@ const Thumbnail = ({ filename, sourcePath, current, onClick }) => {
         className="w-full h-full object-cover"
         alt={filename}
         loading="lazy"
+        draggable={false}
+        onDragStart={(e) => e.preventDefault()}
         onError={(e) => {
           e.target.style.display = "none"; // Hide if fails
           // e.target.parentElement.classList.add('bg-red-900'); // Optional visual indicator
@@ -714,12 +1004,73 @@ function App() {
   const [sortConfig, setSortConfig] = useState({ by: "name", order: "asc" }); // 'name', 'date', 'size'
   const [showSort, setShowSort] = useState(false);
 
+  // Dock appearance, persisted together with the session.
+  const [cardSize, setCardSize] = useState(DEFAULT_CARD_SIZE);
+  const [dockRows, setDockRows] = useState(DEFAULT_DOCK_ROWS);
+  const [stateLoaded, setStateLoaded] = useState(false);
+  const cardSizeDef = CARD_SIZES[cardSize] ?? CARD_SIZES[DEFAULT_CARD_SIZE];
+
   useEffect(() => {
     localStorage.setItem("mediasort_shortcuts", JSON.stringify(shortcuts));
   }, [shortcuts]);
 
+  // Restore the last session once on startup: source folder, destination
+  // folders and dock preferences all come back automatically.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await waitForBridge();
+      const state = await callApi("load_state");
+      if (cancelled) return;
+      if (state) {
+        // Never clobber something the user already did while the state file was
+        // still being read (the bridge call is async and can land late).
+        if (state.source) setSourcePath((prev) => prev ?? state.source);
+        if (Array.isArray(state.destinations) && state.destinations.length) {
+          setDestinations((prev) => (prev.length ? prev : state.destinations));
+        }
+        if (CARD_SIZES[state.card_size]) setCardSize(state.card_size);
+        if (DOCK_ROW_OPTIONS.includes(state.dock_rows)) {
+          setDockRows(state.dock_rows);
+        }
+      }
+      setStateLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist whenever the session changes. Guarded by stateLoaded, so the
+  // restore pass cannot overwrite the stored state with empty defaults.
+  useEffect(() => {
+    if (!stateLoaded) return undefined;
+    const timer = setTimeout(() => {
+      callApi("save_state", {
+        source: sourcePath,
+        destinations,
+        card_size: cardSize,
+        dock_rows: dockRows,
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [stateLoaded, sourcePath, destinations, cardSize, dockRows]);
+
   const imageRef = useRef(null);
   const thumbnailRefs = useRef([]); // Ensure initialized
+
+  // --- Drag preview -> destination state ---
+  // dragPayload: only set while a drag is actually in flight (drives the ghost).
+  const [dragPayload, setDragPayload] = useState(null);
+  const [dragOverPath, setDragOverPath] = useState(null);
+  const destinationRefs = useRef(new Map()); // destination path -> DOM node
+  const ghostRef = useRef(null);
+  const dragSessionRef = useRef(null);
+  const videoRef = useRef(null);
+  const suppressClickUntilRef = useRef(0);
+
+  // Abort any drag that is still listening when the app unmounts.
+  useEffect(() => () => releaseDragSession(dragSessionRef), []);
 
   // ... (Logic methods)
   // ...
@@ -860,10 +1211,17 @@ function App() {
     setDestinations(destinations.filter((d) => d !== path));
   };
 
-  const handleMove = async (destPath) => {
-    if (!images[currentIndex]) return;
+  // Moves one file into a destination folder. Works for the current preview as
+  // well as for any thumbnail dragged out of the carousel.
+  const moveFileToDestination = async (destPath, filename, fileIndex) => {
+    if (!destPath || !filename) return;
 
-    const filename = images[currentIndex];
+    const index =
+      typeof fileIndex === "number" && images[fileIndex] === filename
+        ? fileIndex
+        : images.indexOf(filename);
+    if (index < 0) return;
+
     const res = await callApi("move_image", filename, sourcePath, destPath);
 
     if (res && res.success) {
@@ -871,15 +1229,132 @@ function App() {
         ...prev,
         { type: "move", filename, from: sourcePath, to: destPath },
       ]);
-      const newImages = [...images];
-      newImages.splice(currentIndex, 1);
+      const newImages = images.filter((_, i) => i !== index);
       setImages(newImages);
-      if (currentIndex >= newImages.length) {
-        setCurrentIndex(Math.max(0, newImages.length - 1));
-      }
+      setCurrentIndex((prev) => {
+        if (index < prev) return Math.max(0, prev - 1);
+        if (index === prev) return Math.max(0, Math.min(prev, newImages.length - 1));
+        return prev;
+      });
     } else {
-      alert("Failed to move image: " + (res?.error || "Unknown error"));
+      alert("Failed to move file: " + (res?.error || "Unknown error"));
     }
+  };
+
+  const handleMove = (destPath) =>
+    moveFileToDestination(destPath, images[currentIndex], currentIndex);
+
+  // --- Drag the preview (or a carousel thumbnail) onto a destination card ---
+
+  const registerDestinationRef = (path, el) => {
+    if (el) destinationRefs.current.set(path, el);
+    else destinationRefs.current.delete(path);
+  };
+
+  // Returns the destination path under the given viewport point, if any.
+  const findDestinationAt = (x, y) => {
+    let hit = null;
+    destinationRefs.current.forEach((el, path) => {
+      if (hit !== null) return;
+      const rect = el.getBoundingClientRect();
+      if (
+        x >= rect.left &&
+        x <= rect.right &&
+        y >= rect.top &&
+        y <= rect.bottom
+      ) {
+        hit = path;
+      }
+    });
+    return hit;
+  };
+
+  const positionGhost = (x, y) => {
+    const el = ghostRef.current;
+    if (el) el.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  };
+
+  const startClassificationDrag = (e, filename) => {
+    if (!filename || e.button !== 0 || !destinations.length) return;
+    if (!images.includes(filename)) return;
+    // Interactive overlays (zoom bar, info chips...) opt out via data-no-drag.
+    if (e.target?.closest?.("[data-no-drag]")) return;
+    // Pressing the native video control strip must not start a drag.
+    if (e.target?.tagName === "VIDEO") {
+      const rect = e.target.getBoundingClientRect();
+      if (e.clientY > rect.bottom - VIDEO_CONTROLS_STRIP_PX) return;
+    }
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const session = { move: null, up: null, cancel: null, key: null, raf: 0 };
+    let active = false;
+    let pending = null;
+
+    const onMove = (ev) => {
+      if (!active) {
+        if (
+          Math.hypot(ev.clientX - startX, ev.clientY - startY) <
+          DRAG_THRESHOLD_PX
+        ) {
+          return;
+        }
+        active = true;
+        // Swallow the click that the browser would fire on release.
+        suppressClickUntilRef.current = Date.now() + 400;
+        document.body.classList.add("mediasort-dragging");
+        // A playing video keeps the file locked by the media stack on Windows;
+        // pause it before it has to be moved.
+        if (videoRef.current && !videoRef.current.paused) {
+          videoRef.current.pause();
+        }
+        positionGhost(ev.clientX, ev.clientY);
+        setDragPayload({
+          filename,
+          thumbUrl: buildAssetUrl(sourcePath, filename, "thumbnail"),
+          isVideo: isVideoFilename(filename),
+          x: ev.clientX,
+          y: ev.clientY,
+        });
+      }
+
+      pending = ev;
+      if (session.raf) return;
+      session.raf = requestAnimationFrame(() => {
+        session.raf = 0;
+        if (!pending) return;
+        positionGhost(pending.clientX, pending.clientY);
+        const over = findDestinationAt(pending.clientX, pending.clientY);
+        setDragOverPath((prev) => (prev === over ? prev : over));
+      });
+    };
+
+    const finish = (ev, cancelled) => {
+      releaseDragSession(dragSessionRef);
+      if (!active) return;
+      const over = cancelled
+        ? null
+        : findDestinationAt(ev.clientX, ev.clientY);
+      setDragPayload(null);
+      setDragOverPath(null);
+      if (over) moveFileToDestination(over, filename);
+    };
+
+    session.move = onMove;
+    session.up = (ev) => finish(ev, false);
+    session.cancel = (ev) => finish(ev, true);
+    session.key = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        finish(ev, true);
+      }
+    };
+
+    dragSessionRef.current = session;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", session.up);
+    window.addEventListener("pointercancel", session.cancel);
+    window.addEventListener("keydown", session.key);
   };
 
   const handleDeleteClick = () => {
@@ -932,13 +1407,30 @@ function App() {
       // Ignore if no images
       if (!images.length) return;
 
-      if (e.key === shortcuts.next) handleNext();
-      if (e.key === shortcuts.prev) handlePrev();
-      if (e.key === shortcuts.delete) handleDeleteClick();
+      // Key comparisons are case-insensitive, so "W" and "w" behave the same.
+      const pressedKey = typeof e.key === "string" ? e.key.toLowerCase() : "";
+      const matchesAction = (bound) =>
+        typeof bound === "string" && bound.toLowerCase() === pressedKey;
 
-      const num = parseInt(e.key);
-      if (!isNaN(num) && num > 0 && num <= destinations.length) {
-        handleMove(destinations[num - 1]);
+      if (matchesAction(shortcuts.next)) handleNext();
+      if (matchesAction(shortcuts.prev)) handlePrev();
+      if (matchesAction(shortcuts.delete)) handleDeleteClick();
+
+      // Modifier combos (Ctrl+1, Alt+3...) belong to the host application.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      // A key already bound to Next/Previous/Delete keeps that meaning.
+      if (isKeyReservedForAction(keyCharFromEvent(e), shortcuts)) return;
+
+      // 1..9 -> cards 1..9, 0 -> card 10, then QWERTYUIOP / ASDFGHJKL / ZXCVBNM.
+      const destIndex = destinationIndexForKey(e);
+      if (destIndex >= 0 && destIndex < destinations.length) {
+        e.preventDefault();
+        moveFileToDestination(
+          destinations[destIndex],
+          images[currentIndex],
+          currentIndex,
+        );
       }
     };
     window.addEventListener("keydown", handleKey);
@@ -1087,7 +1579,7 @@ function App() {
               onClick={() => setShowSettings(true)}
               variant="ghost"
               className="!p-2 w-9 h-9 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition-all"
-              title="Keyboard Shortcuts"
+              title="Settings"
             >
               <Settings size={18} />
             </Button>
@@ -1228,7 +1720,12 @@ function App() {
           >
             <div className="relative w-full h-full max-w-5xl max-h-full flex flex-col">
               {/* Image Container */}
-              <div className="flex-1 relative rounded-3xl overflow-hidden bg-[#0a0a0a] border border-white/10 shadow-[0_0_60px_-15px_rgba(79,70,229,0.1)] flex items-center justify-center group ring-1 ring-white/5">
+              <div
+                className="flex-1 relative rounded-3xl overflow-hidden bg-[#0a0a0a] border border-white/10 shadow-[0_0_60px_-15px_rgba(79,70,229,0.1)] flex items-center justify-center group ring-1 ring-white/5"
+                onPointerDown={(e) =>
+                  startClassificationDrag(e, images[currentIndex])
+                }
+              >
                 {/* Content */}
                 {isDone ? (
                   <motion.div
@@ -1269,6 +1766,7 @@ function App() {
                         {currentImageSrc.startsWith("video|") ? (
                           <div className="w-full h-full flex items-center justify-center bg-black/80 relative z-10">
                             <video
+                              ref={videoRef}
                               src={currentImageSrc.substring(6)}
                               type={
                                 images[currentIndex].endsWith(".mp4")
@@ -1306,15 +1804,28 @@ function App() {
                 )}
 
                 {/* Image Info Overlay */}
-                {/* Image Info Overlay */}
                 {!isDone && (
                   <div className="absolute top-4 left-4 right-4 flex justify-between items-start z-20 pointer-events-none">
-                    <div className="bg-black/60 backdrop-blur-md px-4 py-2 rounded-xl border border-white/10 text-sm font-mono text-gray-300 pointer-events-auto">
+                    <div
+                      data-no-drag
+                      className="bg-black/60 backdrop-blur-md px-4 py-2 rounded-xl border border-white/10 text-sm font-mono text-gray-300 pointer-events-auto"
+                    >
                       {images[currentIndex]}
                     </div>
-                    <div className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-xs font-bold text-gray-400 flex items-center pointer-events-auto">
+                    <div
+                      data-no-drag
+                      className="bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg border border-white/10 text-xs font-bold text-gray-400 flex items-center pointer-events-auto"
+                    >
                       {currentIndex + 1} / {images.length}
                     </div>
+                  </div>
+                )}
+
+                {/* Drag hint */}
+                {!isDone && currentImageSrc && (
+                  <div className="absolute bottom-4 left-4 z-20 px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-md border border-white/10 text-[10px] font-bold uppercase tracking-wider text-gray-400 group-hover:text-gray-200 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-all pointer-events-none">
+                    <Move size={12} className="text-indigo-400" />
+                    Drag to a folder below
                   </div>
                 )}
               </div>
@@ -1361,7 +1872,10 @@ function App() {
                   <button
                     key={image || idx}
                     ref={(el) => (thumbnailRefs.current[actualIdx] = el)}
+                    onPointerDown={(e) => startClassificationDrag(e, image)}
                     onClick={() => {
+                      // This click is the tail of a drag: keep the current file.
+                      if (Date.now() < suppressClickUntilRef.current) return;
                       setCurrentIndex(actualIdx);
                     }}
                     className={clsx(
@@ -1404,7 +1918,7 @@ function App() {
       </main>
 
       {/* Bottom Dock (Destinations) */}
-      <footer className="h-52 border-t border-white/5 bg-[#080808]/90 backdrop-blur-2xl z-30 flex flex-col shadow-[0_-10px_40px_-15px_rgba(0,0,0,0.5)]">
+      <footer className="border-t border-white/5 bg-[#080808]/90 backdrop-blur-2xl z-30 flex flex-col shadow-[0_-10px_40px_-15px_rgba(0,0,0,0.5)]">
         <div className="px-6 py-3 flex items-center justify-between border-b border-white/5 bg-white/[0.02]">
           <div className="flex items-center gap-2 text-gray-400">
             <Move size={14} className="text-indigo-500" />
@@ -1421,7 +1935,28 @@ function App() {
           </button>
         </div>
 
-        <div className="flex-1 overflow-x-auto p-4 flex gap-4 items-center px-6 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+        {/* One row scrolls sideways; two or more rows wrap and scroll vertically
+            once the configured row count is exceeded. */}
+        <div
+          data-dock
+          className={clsx(
+            "px-4 py-3 flex gap-1.5 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent",
+            dockRows > 1
+              ? "flex-wrap content-start overflow-y-auto"
+              : "flex-nowrap items-center overflow-x-auto",
+          )}
+          style={
+            dockRows > 1
+              ? {
+                  maxHeight: `${
+                    dockRows * cardSizeDef.height +
+                    (dockRows - 1) * DOCK_GAP_PX +
+                    DOCK_PADDING_PX
+                  }px`,
+                }
+              : undefined
+          }
+        >
           <AnimatePresence initial={false}>
             {destinations.map((path, idx) => (
               <DestinationCard
@@ -1430,23 +1965,70 @@ function App() {
                 index={idx}
                 onClick={() => handleMove(path)}
                 onRemove={handleRemoveDestination}
+                isDropTarget={dragOverPath === path}
+                innerRef={(el) => registerDestinationRef(path, el)}
+                shortcuts={shortcuts}
+                sizeDef={cardSizeDef}
               />
             ))}
           </AnimatePresence>
 
           <button
             onClick={handleAddDestination}
-            className="flex-shrink-0 w-36 h-32 border border-dashed border-white/10 hover:border-indigo-500/30 hover:bg-indigo-500/5 rounded-2xl flex flex-col items-center justify-center gap-3 text-gray-500 hover:text-indigo-400 transition-all group"
+            className={clsx(
+              "flex-shrink-0 border border-dashed border-white/10 hover:border-indigo-500/30 hover:bg-indigo-500/5 rounded-xl flex flex-col items-center justify-center gap-1.5 text-gray-500 hover:text-indigo-400 transition-all group",
+              cardSizeDef.box,
+            )}
           >
-            <div className="p-3 rounded-full bg-white/5 group-hover:bg-indigo-500/10 transition-colors">
-              <Plus size={20} />
+            <div className="p-1.5 rounded-full bg-white/5 group-hover:bg-indigo-500/10 transition-colors">
+              <Plus size={16} />
             </div>
-            <span className="text-[10px] uppercase font-bold tracking-wider">
+            <span className="text-[9px] uppercase font-bold tracking-wider text-center px-1">
               New Folder
             </span>
           </button>
         </div>
       </footer>
+
+      {/* Drag ghost that follows the cursor while sorting */}
+      {dragPayload && (
+        <div
+          ref={ghostRef}
+          className="fixed top-0 left-0 z-[200] pointer-events-none"
+          style={{
+            transform: `translate3d(${dragPayload.x}px, ${dragPayload.y}px, 0)`,
+            willChange: "transform",
+          }}
+        >
+          <div className="-translate-x-1/2 -translate-y-1/2 flex items-center gap-2.5 pl-1.5 pr-3 py-1.5 rounded-xl bg-[#0b0b0b]/95 border border-emerald-400/40 shadow-[0_12px_40px_-12px_rgba(16,185,129,0.6)] backdrop-blur-sm">
+            <div className="w-10 h-10 rounded-lg overflow-hidden bg-black/60 flex items-center justify-center flex-shrink-0">
+              {dragPayload.thumbUrl ? (
+                <img
+                  src={dragPayload.thumbUrl}
+                  alt=""
+                  draggable={false}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <ImageIcon size={16} className="text-gray-500" />
+              )}
+            </div>
+            <div className="flex flex-col min-w-0">
+              <span className="text-[11px] font-semibold text-gray-100 truncate max-w-[170px]">
+                {dragPayload.filename}
+              </span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 truncate max-w-[170px]">
+                {dragOverPath
+                  ? `Move to ${dragOverPath.split(/[/\\]/).pop()}`
+                  : "Drop on a folder"}
+              </span>
+            </div>
+            {dragPayload.isVideo && (
+              <Video size={14} className="text-gray-500 flex-shrink-0" />
+            )}
+          </div>
+        </div>
+      )}
 
       <AlertPopup
         isOpen={showDeleteAlert}
@@ -1460,6 +2042,10 @@ function App() {
         isOpen={showSettings}
         onClose={() => setShowSettings(false)}
         shortcuts={shortcuts}
+        cardSize={cardSize}
+        onCardSizeChange={setCardSize}
+        dockRows={dockRows}
+        onDockRowsChange={setDockRows}
         onSave={(newShortcuts) => {
           setShortcuts(newShortcuts);
           setShowSettings(false);
